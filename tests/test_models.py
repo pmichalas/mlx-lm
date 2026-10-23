@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
+    trim_prompt_cache,
 )
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
@@ -3558,6 +3559,79 @@ class TestModels(unittest.TestCase):
 
         err = mx.abs(got[uids[1]] - alone).max().item()
         self.assertLess(err, 1e-5)
+
+    def _granite_switch_model(self):
+        from mlx_lm.models import granite_switch
+
+        config = {
+            "model_type": "granite_switch",
+            "vocab_size": 100,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "shared_intermediate_size": 128,
+            "num_hidden_layers": 4,  # 2 switch cache slots + 2 decoder layers
+            "max_position_embeddings": 512,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "projection_head_dim": 16,
+            "embedding_multiplier": 12.0,
+            "attention_multiplier": 0.0625,
+            "logits_scaling": 16.0,
+            "residual_multiplier": 0.22,
+            "rms_norm_eps": 1e-5,
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "num_adapters": 2,
+            "adapter_ranks": [4, 8],
+            "adapter_token_ids": [98, 99],
+            "adapter_substitute_token_ids": [3, 4],
+        }
+        args = granite_switch.ModelArgs.from_dict(config)
+        return granite_switch.Model(args), args
+
+    def test_granite_switch(self):
+        model, args = self._granite_switch_model()
+        self.assertEqual(args.rope_theta, 10000.0)
+        self.model_test_runner(model, args.model_type, args.vocab_size, 2)
+
+    def test_granite_switch_routing(self):
+        mx.random.seed(0)
+        model, args = self._granite_switch_model()
+        # Give every adapter a non-zero LoRA so routing is observable.
+        model.update(
+            tree_map(
+                lambda p: mx.random.normal(p.shape) * 0.2 if p.size else p,
+                model.parameters(),
+            )
+        )
+        body = list(range(5, 25))
+        # Routing: base until a control token, then that adapter onwards;
+        # control tokens are exchanged for their substitute ids.
+        idx, toks = model.model.route(mx.array([body[:3] + [99] + body[3:6]]))
+        self.assertEqual(idx[0].tolist(), [0, 0, 0, 2, 2, 2, 2])
+        self.assertEqual(toks[0].tolist(), body[:3] + [4] + body[3:6])
+
+        plain = model(mx.array([body]))
+        with_ctrl = model(mx.array([body[:8] + [98] + body[8:]]))
+        # Tokens before the control token run on the base model only.
+        self.assertTrue(mx.allclose(plain[:, :8], with_ctrl[:, :8], atol=1e-5))
+        self.assertFalse(mx.allclose(plain[:, 8:], with_ctrl[:, 9:], atol=1e-3))
+
+        # Chunked prefill + token-by-token decode == one full forward,
+        # with the control token in an earlier chunk.
+        ids = body[:6] + [99] + body[6:]
+        full = model(mx.array([ids]))
+        cache = make_prompt_cache(model)
+        parts = [model(mx.array([ids[:4]]), cache=cache)]
+        parts.append(model(mx.array([ids[4:10]]), cache=cache))
+        for t in ids[10:]:
+            parts.append(model(mx.array([[t]]), cache=cache))
+        self.assertTrue(mx.allclose(full, mx.concatenate(parts, axis=1), atol=1e-4))
+
+        # Trimming back before the control token restores base routing.
+        trim_prompt_cache(cache, len(ids) - 6)
+        out = model(mx.array([body[6:9]]), cache=cache)
+        ref = model(mx.array([body[:9]]))[:, 6:]
+        self.assertTrue(mx.allclose(out, ref, atol=1e-4))
 
     def test_laguna_sanitize(self):
         from mlx_lm.models import laguna

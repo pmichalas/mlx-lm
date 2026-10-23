@@ -420,6 +420,20 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+class SwitchCache(KVCache):
+    """
+    Per-token routing trace for switch-routed models (e.g. Granite Switch).
+
+    The "keys" hold one value per token (shape ``[B, 1, T, 1]``): the adapter
+    index active at that position. Keeping it in KV-cache form means trimming,
+    prompt-cache reuse and batch merging stay aligned with the attention caches
+    for free. It is never quantized.
+    """
+
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        return self
+
+
 class RotatingKVCache(_BaseCache):
     step = 256
 
